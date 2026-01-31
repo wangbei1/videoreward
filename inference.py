@@ -419,7 +419,7 @@ def get_mock_vae_output(video_path, num_frames=100, height=480, width=832, devic
     # 1. 读取视频帧 [T, H, W, C]
     # pts_unit='sec' 确保时间戳对齐
     vframes, _, _ = io.read_video(video_path, pts_unit='sec', output_format="TCHW")
-    
+
     # 2. 均匀采样帧数
     total_frames = vframes.shape[0]
     indices = torch.linspace(0, total_frames - 1, steps=num_frames).long()
@@ -434,11 +434,125 @@ def get_mock_vae_output(video_path, num_frames=100, height=480, width=832, devic
     # 4. 核心步骤：归一化到 [-1, 1]
     # 公式：(x / 127.5) - 1.0
     video_vae_style = (video_tensor / 127.5) - 1.0
-    
+
     # 5. 开启梯度，模拟训练状态
     video_vae_style.requires_grad = True
-    
+
     return video_vae_style
+
+
+def get_video_tensor_for_reward(video_path, num_frames, max_pixels, sample_type="uniform", device="cuda"):
+    """
+    严格按照官方 fetch_video 逻辑读取视频，返回可微分的张量。
+
+    这个函数的输出与 process_vision_info 完全一致，但保持 requires_grad=True。
+
+    Args:
+        video_path: 视频路径
+        num_frames: 采样帧数
+        max_pixels: 每帧最大像素数
+        sample_type: 采样类型 ("uniform" 或 "multi_pts")
+        device: 设备
+
+    Returns:
+        video_tensor: [T, C, H, W] float32 张量，范围 [0, 255]，可求梯度
+        resized_height: resize 后的高度
+        resized_width: resize 后的宽度
+    """
+    from vision_process import smart_resize, round_by_factor, FRAME_FACTOR
+
+    # 1. 读取视频
+    vframes, _, info = io.read_video(video_path, pts_unit='sec', output_format="TCHW")
+    total_frames = vframes.shape[0]
+    video_fps = info.get("video_fps", 30.0)
+
+    # 2. 帧数处理 - 严格对齐官方逻辑
+    nframes = round_by_factor(num_frames, FRAME_FACTOR)
+    if nframes > total_frames:
+        nframes = total_frames
+
+    # 3. 帧采样 - 使用 .round().long() 与官方一致
+    if sample_type == 'uniform':
+        idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+    elif sample_type == 'multi_pts':
+        frames_each_pts = 6
+        num_pts = 4
+        fps = 8
+        nframes_temp = int(total_frames * fps // video_fps)
+        frames_idx = torch.linspace(0, total_frames - 1, nframes_temp).round().long().tolist()
+        start_pt = int(frames_each_pts // 2)
+        end_pt = int(nframes_temp - frames_each_pts // 2 - 1)
+        pts = torch.linspace(start_pt, end_pt, num_pts).round().long().tolist()
+        idx = []
+        for pt in pts:
+            idx.extend(frames_idx[pt - frames_each_pts // 2 : pt + frames_each_pts // 2])
+    else:
+        idx = torch.linspace(0, total_frames - 1, nframes).round().long().tolist()
+
+    video = vframes[idx]  # [T, C, H, W]
+    nframes, _, height, width = video.shape
+
+    # 4. 计算 resize 尺寸 - 严格按照 fetch_video 逻辑
+    VIDEO_MIN_PIXELS = 128 * 28 * 28
+    VIDEO_MAX_PIXELS = 768 * 28 * 28
+    VIDEO_TOTAL_PIXELS = 24576 * 28 * 28
+
+    min_pixels = VIDEO_MIN_PIXELS
+    total_pixels = VIDEO_TOTAL_PIXELS
+    computed_max_pixels = max(min(VIDEO_MAX_PIXELS, total_pixels / nframes * FRAME_FACTOR), int(min_pixels * 1.05))
+    final_max_pixels = max_pixels if max_pixels is not None else computed_max_pixels
+
+    resized_height, resized_width = smart_resize(
+        height, width,
+        factor=28,
+        min_pixels=min_pixels,
+        max_pixels=final_max_pixels,
+    )
+
+    # 5. Resize - 与官方完全一致
+    video_tensor = transforms.functional.resize(
+        video,
+        [resized_height, resized_width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    ).float().to(device)
+
+    # 6. 开启梯度
+    video_tensor.requires_grad = True
+
+    return video_tensor, resized_height, resized_width
+
+
+def vae_output_to_pixel_values(vae_output, target_height, target_width, processor):
+    """
+    将 VAE 输出 ([-1, 1]) 转换为 VLM 所需的 pixel_values。
+
+    完整的可微分流水线：VAE output -> resize -> normalize -> 9维拆解
+
+    Args:
+        vae_output: [T, C, H, W] 张量，范围 [-1, 1]，来自 VAE decoder
+        target_height: 目标高度 (必须是 28 的倍数)
+        target_width: 目标宽度 (必须是 28 的倍数)
+        processor: Qwen2-VL processor
+
+    Returns:
+        pixel_values_videos: [N, 1176] 格式的 token 张量
+    """
+    # 1. 转回 [0, 255] 范围
+    video_255 = (vae_output + 1.0) * 127.5
+
+    # 2. Resize 到目标尺寸 (只做一次 resize)
+    video_resized = transforms.functional.resize(
+        video_255,
+        [target_height, target_width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    )
+
+    # 3. 9 维对齐处理
+    pixel_values = differentiable_process_vlm_video_v446(video_resized, processor)
+
+    return pixel_values
 
 
 import torch
@@ -536,9 +650,118 @@ def compare_manual_vs_official_rewards(inferencer, video_path, prompt):
 import random
 from tqdm import tqdm
 
+
+def batch_validate_reward_consistency_v2(inferencer, video_dir, num_samples=100):
+    """
+    修复后的批量验证函数 - 确保官方路径和手动路径完全一致。
+
+    核心修复：
+    1. 使用 get_video_tensor_for_reward 与官方帧采样和 resize 逻辑完全一致
+    2. 避免两次 resize 导致的累积误差
+    3. 使用 .round().long() 与官方帧索引计算一致
+    """
+    print(f"\n开始批量验证 (V2 - 修复版)... 目标样本数: {num_samples}")
+
+    all_videos = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
+    if len(all_videos) < num_samples:
+        print(f"警告: 视频数量不足 {num_samples}，将处理所有 {len(all_videos)} 个视频。")
+        sample_videos = all_videos
+    else:
+        sample_videos = random.sample(all_videos, num_samples)
+
+    results = []
+    num_frames = inferencer.data_config.num_frames if inferencer.data_config.num_frames else 10
+    max_pixels = inferencer.data_config.max_frame_pixels
+
+    for vid_name in tqdm(sample_videos):
+        video_path = os.path.join(video_dir, vid_name)
+        prompt = "The video shows natural movement and high quality scene."
+
+        try:
+            with torch.no_grad():
+                # --- 官方路径 ---
+                batch_off = inferencer.prepare_batch([video_path], [prompt], num_frames=num_frames)
+                res_off = inferencer.model(**batch_off)["logits"].float().cpu()[0]
+                gt_pixels = batch_off['pixel_values_videos'].float().cpu()
+
+            # --- 手动可微路径 (使用修复后的函数) ---
+            # 1. 使用与官方完全一致的视频读取和 resize 逻辑
+            video_tensor, resized_h, resized_w = get_video_tensor_for_reward(
+                video_path,
+                num_frames=num_frames,
+                max_pixels=max_pixels,
+                sample_type=inferencer.data_config.sample_type,
+                device=inferencer.device
+            )
+
+            # 2. 直接进行 9 维处理 (不需要额外 resize，因为 get_video_tensor_for_reward 已经处理好)
+            pixel_values_manual = differentiable_process_vlm_video_v446(video_tensor, inferencer.processor)
+
+            # 3. 构造 batch 并推理
+            batch_man = {
+                "input_ids": batch_off["input_ids"],
+                "attention_mask": batch_off["attention_mask"],
+                "video_grid_thw": batch_off["video_grid_thw"],
+                "pixel_values_videos": pixel_values_manual.to(inferencer.model.dtype)
+            }
+
+            with torch.no_grad():
+                res_man = inferencer.model(**batch_man)["logits"].float().cpu()[0]
+
+            # 4. 检查 pixel 差异
+            pixel_manual_cpu = pixel_values_manual.detach().float().cpu()
+            pixel_mse = torch.mean((gt_pixels - pixel_manual_cpu)**2).item()
+
+            # 5. 记录数据
+            diff = torch.abs(res_off - res_man)
+            results.append({
+                'video': vid_name,
+                'pixel_mse': pixel_mse,
+                'off_VQ': res_off[0].item(), 'man_VQ': res_man[0].item(),
+                'off_MQ': res_off[1].item(), 'man_MQ': res_man[1].item(),
+                'off_TA': res_off[2].item(), 'man_TA': res_man[2].item(),
+                'diff_VQ': diff[0].item(), 'diff_MQ': diff[1].item(), 'diff_TA': diff[2].item(),
+                'sign_match_VQ': (res_off[0] * res_man[0] > 0).item(),
+                'sign_match_MQ': (res_off[1] * res_man[1] > 0).item(),
+                'sign_match_TA': (res_off[2] * res_man[2] > 0).item()
+            })
+
+        except Exception as e:
+            print(f"跳过视频 {vid_name}, 错误: {e}")
+            import traceback
+            traceback.print_exc()
+
+    df = pd.DataFrame(results)
+
+    print("\n" + "="*20 + " 批量验证统计报告 (V2) " + "="*20)
+    stats = {
+        "平均 Pixel MSE": df['pixel_mse'].mean(),
+        "平均绝对误差 (MAE) - VQ": df['diff_VQ'].mean(),
+        "平均绝对误差 (MAE) - MQ": df['diff_MQ'].mean(),
+        "平均绝对误差 (MAE) - TA": df['diff_TA'].mean(),
+        "正负号一致率 (VQ)": df['sign_match_VQ'].mean(),
+        "正负号一致率 (MQ)": df['sign_match_MQ'].mean(),
+        "正负号一致率 (TA)": df['sign_match_TA'].mean(),
+        "最大绝对偏差 (MaxDiff)": df[['diff_VQ', 'diff_MQ', 'diff_TA']].max().max()
+    }
+
+    for k, v in stats.items():
+        print(f"{k:30}: {v:.6f}")
+
+    print("\n[相关性分析]")
+    print(f"VQ 相关系数: {df['off_VQ'].corr(df['man_VQ']):.4f}")
+    print(f"MQ 相关系数: {df['off_MQ'].corr(df['man_MQ']):.4f}")
+    print(f"TA 相关系数: {df['off_TA'].corr(df['man_TA']):.4f}")
+
+    return df
+
+
 def batch_validate_reward_consistency(inferencer, video_dir, num_samples=100):
+    """
+    原始验证函数 - 保留用于对比，但推荐使用 batch_validate_reward_consistency_v2
+    """
     print(f"\n开始批量验证... 目标样本数: {num_samples}")
-    
+
     # 1. 获取目录下所有视频文件
     all_videos = [f for f in os.listdir(video_dir) if f.endswith(('.mp4', '.avi', '.mov'))]
     if len(all_videos) < num_samples:
@@ -549,13 +772,13 @@ def batch_validate_reward_consistency(inferencer, video_dir, num_samples=100):
 
     # 2. 初始化统计列表
     results = []
-    
+
     # 3. 循环测试
     for vid_name in tqdm(sample_videos):
         video_path = os.path.join(video_dir, vid_name)
         # 这里可以使用动态 Prompt，或者固定一个通用 Prompt
         prompt = "The video shows natural movement and high quality scene."
-        
+
         try:
             # 使用之前的对比逻辑获取结果 (注意: compare_manual_vs_official_rewards 需要稍微改动返回 diff 数据)
             # 为了加速，我们在 compare 内部用 torch.no_grad()
@@ -563,21 +786,21 @@ def batch_validate_reward_consistency(inferencer, video_dir, num_samples=100):
                 # --- 官方路径 ---
                 batch_off = inferencer.prepare_batch([video_path], [prompt], num_frames=10)
                 res_off = inferencer.model(**batch_off)["logits"].float().cpu()[0]
-                
+
                 # --- 手动路径 ---
                 # 模拟 VAE 输出
                 vae_out = get_mock_vae_output(video_path, num_frames=10)
                 vae_255 = (vae_out + 1) / 2 * 255.0
-                
+
                 # 匹配尺寸并 Resize
                 grid_thw = batch_off['video_grid_thw'][0]
                 th, tw = grid_thw[1] * 14, grid_thw[2] * 14
-                v_res = transforms.functional.resize(vae_255, [th, tw], 
+                v_res = transforms.functional.resize(vae_255, [th, tw],
                                                      interpolation=InterpolationMode.BICUBIC, antialias=True)
-                
+
                 # 9维处理
                 pix_man = differentiable_process_vlm_video_v446(v_res, inferencer.processor)
-                
+
                 # 推理
                 batch_man = {
                     "input_ids": batch_off["input_ids"],
@@ -605,7 +828,7 @@ def batch_validate_reward_consistency(inferencer, video_dir, num_samples=100):
 
     # 5. 聚合统计分析
     df = pd.DataFrame(results)
-    
+
     print("\n" + "="*20 + " 批量验证统计报告 " + "="*20)
     stats = {
         "平均绝对误差 (MAE) - VQ": df['diff_VQ'].mean(),
@@ -616,7 +839,7 @@ def batch_validate_reward_consistency(inferencer, video_dir, num_samples=100):
         "正负号一致率 (TA)": df['sign_match_TA'].mean(),
         "最大绝对偏差 (MaxDiff)": df[['diff_VQ', 'diff_MQ', 'diff_TA']].max().max()
     }
-    
+
     for k, v in stats.items():
         print(f"{k:25}: {v:.4f}")
 
@@ -625,18 +848,162 @@ def batch_validate_reward_consistency(inferencer, video_dir, num_samples=100):
     print(f"VQ 相关系数: {df['off_VQ'].corr(df['man_VQ']):.4f}")
     print(f"MQ 相关系数: {df['off_MQ'].corr(df['man_MQ']):.4f}")
     print(f"TA 相关系数: {df['off_TA'].corr(df['man_TA']):.4f}")
-    
+
     return df
 
+class DifferentiableVideoReward:
+    """
+    可微分的视频奖励推理类，用于 RL 训练。
+
+    使用方法：
+    ```python
+    reward_model = DifferentiableVideoReward("./checkpoints", device="cuda:0")
+
+    # 从 VAE decoder 输出计算奖励 (保持梯度)
+    vae_output = vae.decode(latent)  # [-1, 1] 范围
+    reward = reward_model.compute_reward_from_vae_output(
+        vae_output,
+        prompt="A cat walking on grass",
+        target_height=336,  # 必须是 28 的倍数
+        target_width=504,   # 必须是 28 的倍数
+    )
+    # reward 形状: [1, 3] (VQ, MQ, TA)
+    # 可以直接 .backward()
+    loss = -reward.sum()
+    loss.backward()
+    ```
+    """
+
+    def __init__(self, load_from_pretrained, load_from_pretrained_step=-1, device='cuda', dtype=torch.bfloat16):
+        self.inferencer = VideoVLMRewardInference(
+            load_from_pretrained,
+            load_from_pretrained_step=load_from_pretrained_step,
+            device=device,
+            dtype=dtype
+        )
+        self.device = device
+        self.dtype = dtype
+
+    def compute_reward_from_vae_output(self, vae_output, prompt, target_height, target_width):
+        """
+        从 VAE 输出计算可微分的奖励。
+
+        Args:
+            vae_output: [T, C, H, W] 张量，范围 [-1, 1]，来自 VAE decoder
+            prompt: 文本提示
+            target_height: 目标高度 (必须是 28 的倍数)
+            target_width: 目标宽度 (必须是 28 的倍数)
+
+        Returns:
+            rewards: [1, 3] 张量 (VQ, MQ, TA)，保持梯度
+        """
+        assert target_height % 28 == 0, f"target_height 必须是 28 的倍数，当前为 {target_height}"
+        assert target_width % 28 == 0, f"target_width 必须是 28 的倍数，当前为 {target_width}"
+
+        # 1. 转换 VAE 输出到 pixel_values
+        pixel_values = vae_output_to_pixel_values(
+            vae_output,
+            target_height,
+            target_width,
+            self.inferencer.processor
+        )
+
+        # 2. 计算 video_grid_thw
+        T = vae_output.shape[0]
+        grid_t = T // 2  # temporal_patch_size = 2
+        grid_h = target_height // 14  # patch_size = 14
+        grid_w = target_width // 14
+        video_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device=self.device)
+
+        # 3. 获取文本 tokens
+        text_batch = self._prepare_text_tokens(prompt)
+
+        # 4. 构造完整 batch
+        batch = {
+            "input_ids": text_batch["input_ids"],
+            "attention_mask": text_batch["attention_mask"],
+            "video_grid_thw": video_grid_thw,
+            "pixel_values_videos": pixel_values.to(self.dtype)
+        }
+
+        # 5. 前向传播
+        outputs = self.inferencer.model(return_dict=True, **batch)
+        rewards = outputs["logits"]
+
+        return rewards
+
+    def _prepare_text_tokens(self, prompt):
+        """准备文本 tokens (不包含视频)"""
+        from prompt_template import build_prompt
+
+        eval_dim = self.inferencer.data_config.eval_dim
+        prompt_template_type = self.inferencer.data_config.prompt_template_type
+
+        chat_data = [[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video"},  # 占位符
+                    {"type": "text", "text": build_prompt(prompt, eval_dim, prompt_template_type)},
+                ],
+            }
+        ]]
+
+        text = self.inferencer.processor.apply_chat_template(chat_data, tokenize=False, add_generation_prompt=True)
+        text_tokens = self.inferencer.processor.tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True
+        )
+
+        return {
+            "input_ids": text_tokens["input_ids"].to(self.device),
+            "attention_mask": text_tokens["attention_mask"].to(self.device)
+        }
+
+    def compute_target_size(self, height, width, num_frames, max_pixels=None):
+        """
+        计算官方的目标 resize 尺寸。
+
+        Args:
+            height: 原始高度
+            width: 原始宽度
+            num_frames: 帧数
+            max_pixels: 可选的最大像素数
+
+        Returns:
+            (target_height, target_width): 28 对齐的目标尺寸
+        """
+        from vision_process import smart_resize, FRAME_FACTOR
+
+        VIDEO_MIN_PIXELS = 128 * 28 * 28
+        VIDEO_MAX_PIXELS = 768 * 28 * 28
+        VIDEO_TOTAL_PIXELS = 24576 * 28 * 28
+
+        min_pixels = VIDEO_MIN_PIXELS
+        total_pixels = VIDEO_TOTAL_PIXELS
+        computed_max_pixels = max(min(VIDEO_MAX_PIXELS, total_pixels / num_frames * FRAME_FACTOR), int(min_pixels * 1.05))
+        final_max_pixels = max_pixels if max_pixels is not None else computed_max_pixels
+
+        target_h, target_w = smart_resize(
+            height, width,
+            factor=28,
+            min_pixels=min_pixels,
+            max_pixels=final_max_pixels,
+        )
+
+        return target_h, target_w
+
+
 if __name__ == "__main__":
-    # from inference import VideoVLMRewardInference
+    # 使用修复后的 V2 验证函数
     inferencer = VideoVLMRewardInference("./checkpoints", device="cuda:0")
-    
+
     video_dir = "/home/wubin/wanx-code/data_mixkit/data/video"
-    df_results = batch_validate_reward_consistency(inferencer, video_dir, num_samples=100)
-    
+    df_results = batch_validate_reward_consistency_v2(inferencer, video_dir, num_samples=100)
+
     # 保存结果备查
-    df_results.to_csv("reward_consistency_test.csv", index=False)
+    df_results.to_csv("reward_consistency_test_v2.csv", index=False)
 # # --- 执行验证 ---
 # if __name__ == "__main__":
 #     # 初始化
