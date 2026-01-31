@@ -915,8 +915,8 @@ class DifferentiableVideoReward:
         grid_w = target_width // 14
         video_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], device=self.device)
 
-        # 3. 获取文本 tokens
-        text_batch = self._prepare_text_tokens(prompt)
+        # 3. 获取文本 tokens（需要传入 grid 信息以正确计算视频 token 数量）
+        text_batch = self._prepare_text_tokens(prompt, grid_t, grid_h, grid_w)
 
         # 4. 构造完整 batch
         batch = {
@@ -932,33 +932,52 @@ class DifferentiableVideoReward:
 
         return rewards
 
-    def _prepare_text_tokens(self, prompt):
-        """准备文本 tokens (不包含视频)"""
+    def _prepare_text_tokens(self, prompt, grid_t, grid_h, grid_w):
+        """
+        准备文本 tokens，正确处理视频占位符。
+
+        Qwen2-VL 的 processor 需要知道视频尺寸来插入正确数量的视频 token。
+        我们通过创建一个假的视频张量（只用于获取正确的 token 数量）来实现。
+        """
         from prompt_template import build_prompt
 
         eval_dim = self.inferencer.data_config.eval_dim
         prompt_template_type = self.inferencer.data_config.prompt_template_type
 
+        # 构造 chat_data
         chat_data = [[
             {
                 "role": "user",
                 "content": [
-                    {"type": "video"},  # 占位符
+                    {"type": "video"},
                     {"type": "text", "text": build_prompt(prompt, eval_dim, prompt_template_type)},
                 ],
             }
         ]]
 
-        text = self.inferencer.processor.apply_chat_template(chat_data, tokenize=False, add_generation_prompt=True)
-        text_tokens = self.inferencer.processor.tokenizer(
-            text,
+        # 创建一个假的视频张量，只用于让 processor 计算正确的 token 数量
+        # 尺寸: [T, C, H, W]，T = grid_t * 2, H = grid_h * 14, W = grid_w * 14
+        dummy_video = torch.zeros(
+            grid_t * 2,  # temporal_patch_size = 2
+            3,
+            grid_h * 14,  # patch_size = 14
+            grid_w * 14,
+            dtype=torch.float32
+        )
+
+        # 使用 processor 获取正确的 input_ids（包含正确数量的视频 token）
+        batch = self.inferencer.processor(
+            text=self.inferencer.processor.apply_chat_template(chat_data, tokenize=False, add_generation_prompt=True),
+            images=None,
+            videos=[dummy_video],
+            padding=True,
             return_tensors="pt",
-            padding=True
+            videos_kwargs={"do_rescale": False},  # dummy video 已经是 [0,1] 范围
         )
 
         return {
-            "input_ids": text_tokens["input_ids"].to(self.device),
-            "attention_mask": text_tokens["attention_mask"].to(self.device)
+            "input_ids": batch["input_ids"].to(self.device),
+            "attention_mask": batch["attention_mask"].to(self.device)
         }
 
     def compute_target_size(self, height, width, num_frames, max_pixels=None):
